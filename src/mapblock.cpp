@@ -60,7 +60,8 @@ MapBlock::MapBlock(Map *parent, v3s16 pos, IGameDef *gamedef, bool dummy):
 		m_timestamp(BLOCK_TIMESTAMP_UNDEFINED),
 		m_disk_timestamp(BLOCK_TIMESTAMP_UNDEFINED),
 		m_usage_timer(0),
-		m_refcount(0)
+		m_refcount(0),
+    m_change_counter(0)
 {
 	data = NULL;
 	if(dummy == false)
@@ -573,7 +574,7 @@ void MapBlock::serialize(std::ostream &os, u8 version, bool disk)
 	if(m_generated == false)
 		flags |= 0x08;
 	writeU8(os, flags);
-	
+
 	/*
 		Bulk node data
 	*/

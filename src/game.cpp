@@ -1418,6 +1418,7 @@ void the_game(
 	bool disable_camera_update = false;
 	bool show_debug = g_settings->getBool("show_debug");
 	bool show_profiler_graph = false;
+  bool show_block_boundaries = false;
 	u32 show_profiler = 0;
 	u32 show_profiler_max = 3;  // Number of pages
 
@@ -1950,6 +1951,15 @@ void the_game(
 				statustext_time = 0;
 			}
 		}
+    else if(input->wasKeyDown(getKeySetting("keymap_toggle_block_boundaries")))
+    {
+			show_block_boundaries = !show_block_boundaries;
+			if(show_block_boundaries)
+				statustext = L"Block boundaries shown";
+			else
+				statustext = L"Block boundaries hidden";
+			statustext_time = 0;
+    }
 		else if(input->wasKeyDown(getKeySetting("keymap_increase_viewing_range_min")))
 		{
 			s16 range = g_settings->getS16("viewing_range_nodes_min");
@@ -2480,7 +2490,7 @@ void the_game(
 		}
 
 		/*
-			Calculate what block is the crosshair pointing to
+			Calculate what object is the crosshair pointing to
 		*/
 		
 		//u32 t1 = device->getTimer()->getRealTime();
@@ -3257,7 +3267,15 @@ void the_game(
 		
 		//timer9.stop();
 		//TimeTaker //timer10("//timer10");
-		
+
+    /*
+      Block boundary visualization
+    */
+
+    if (show_block_boundaries) {
+			client.getEnv().getClientMap().renderBlockBoundaries();
+    }
+
 		video::SMaterial m;
 		//m.Thickness = 10;
 		m.Thickness = 3;

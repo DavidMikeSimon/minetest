@@ -77,6 +77,15 @@ public:
 */
 v3f findSpawnPos(ServerMap &map);
 
+/*
+	A structure containing the data needed for queueing the fetching
+	of blocks.
+*/
+struct QueuedBlockEmerge
+{
+	v3s16 pos;
+	float priority; // Larger = more important; 0 = highest
+};
 
 class MapEditEventIgnorer
 {
@@ -101,6 +110,93 @@ public:
 
 private:
 	bool *m_flag;
+	
+	void addBlock(v3s16 pos, float priority)
+	{
+		DSTACK(__FUNCTION_NAME);
+	
+		JMutexAutoLock lock(m_mutex);
+		
+		// Remove from queue if it's not already queued
+		for(core::list<QueuedBlockEmerge*>::Iterator
+				i=m_queue.begin(); i!=m_queue.end(); i++)
+		{
+			QueuedBlockEmerge *q = *i;
+			if(q->pos == pos){
+				if(q->priority > priority){
+					// Already in queue with a higher priority
+					return;
+				} else{
+					// In queue with a lower priority; remove and re-add
+					delete q;
+					m_queue.erase(i);
+					break;
+				}
+			}
+		}
+	
+		// Add to queue
+
+		QueuedBlockEmerge *newq = new QueuedBlockEmerge;
+		newq->pos = pos;
+		newq->priority = priority;
+
+		if(m_queue.empty()){
+			m_queue.push_back(newq);
+		} else {
+			for(core::list<QueuedBlockEmerge*>::Iterator
+					i=m_queue.begin(); i!=m_queue.end(); i++)
+			{
+				QueuedBlockEmerge *q = *i;
+				if(q->priority < priority){
+					m_queue.insert_before(i, newq);
+					return;
+				}
+			}
+		}
+	}
+
+	// Returned pointer must be deleted
+	// Returns NULL if queue is empty
+	QueuedBlockEmerge * pop()
+	{
+		JMutexAutoLock lock(m_mutex);
+
+		core::list<QueuedBlockEmerge*>::Iterator i = m_queue.begin();
+		if(i == m_queue.end())
+			return NULL;
+		QueuedBlockEmerge *q = *i;
+		m_queue.erase(i);
+		return q;
+	}
+
+	u32 size()
+	{
+		JMutexAutoLock lock(m_mutex);
+		return m_queue.size();
+	}
+	
+private:
+	// Sorted by priority; highest first
+	core::list<QueuedBlockEmerge*> m_queue;
+	JMutex m_mutex;
+};
+
+class Server;
+
+class ServerThread : public SimpleThread
+{
+	Server *m_server;
+
+public:
+
+	ServerThread(Server *server):
+		SimpleThread(),
+		m_server(server)
+	{
+	}
+
+	void * Thread();
 };
 
 class MapEditEventAreaIgnorer
@@ -208,6 +304,103 @@ struct ServerPlayingSound
 	std::set<u16> clients; // peer ids
 };
 
+struct QueuedBlockSend
+{
+	int peer_id;
+	v3s16 pos;
+	float priority; // Larger = more important; 0 = highest
+	double timeout_timestamp;
+
+	QueuedBlockSend():
+		peer_id(0),
+		pos(0,0,0),
+		priority(0),
+		timeout_timestamp(0)
+	{}
+};
+
+class BlockSendQueue
+{
+public:
+	BlockSendQueue()
+	{
+	}
+
+	~BlockSendQueue()
+	{
+		core::list<QueuedBlockSend*>::Iterator i;
+		for(i=m_queue.begin(); i!=m_queue.end(); i++)
+		{
+			QueuedBlockSend *q = *i;
+			delete q;
+		}
+	}
+	
+	void addBlock(int peer_id, v3s16 pos, float priority, float timeout)
+	{
+		float timeout_timestamp = m_timestamp + timeout;
+	
+		// Remove from queue if it's not already queued
+		for(core::list<QueuedBlockSend*>::Iterator
+				i=m_queue.begin(); i!=m_queue.end(); i++)
+		{
+			QueuedBlockSend *q = *i;
+			if(q->peer_id == peer_id && q->pos == pos){
+				if(q->priority > priority && q->timeout_timestamp > timeout_timestamp){
+					// Already in queue with a higher priority and higher timoeut
+					return;
+				} else{
+					// In queue with a lower priority; remove and re-add
+					delete q;
+					m_queue.erase(i);
+					break;
+				}
+			}
+		}
+	
+		// Add to queue
+
+		QueuedBlockSend *newq = new QueuedBlockSend;
+		newq->peer_id = peer_id;
+		newq->pos = pos;
+		newq->priority = priority;
+		newq->timeout_timestamp = timeout_timestamp;
+
+		if(m_queue.empty()){
+			m_queue.push_back(newq);
+		} else {
+			for(core::list<QueuedBlockSend*>::Iterator
+					i=m_queue.begin(); i!=m_queue.end(); i++)
+			{
+				QueuedBlockSend *q = *i;
+				if(q->priority < priority){
+					m_queue.insert_before(i, newq);
+					return;
+				}
+			}
+		}
+	}
+
+	void step(double dtime)
+	{
+		m_timestamp += dtime;
+	}
+
+	u32 size()
+	{
+		return m_queue.size();
+	}
+	
+	// FIXME: This shouldn't require the server at all; the data should be fed
+	// in addBlock and only the connection should be needed here
+	void send(Server &server, float packet_queue_max_seconds);
+
+private:
+	// Sorted by priority; highest first
+	core::list<QueuedBlockSend*> m_queue;
+	double m_timestamp;
+};
+
 class RemoteClient
 {
 public:
@@ -228,8 +421,7 @@ public:
 	bool denied;
 
 	RemoteClient():
-		m_time_from_building(9999),
-		m_excess_gotblocks(0)
+		m_time_from_building(9999)
 	{
 		peer_id = 0;
 		serialization_version = SER_FMT_VER_INVALID;
@@ -245,27 +437,7 @@ public:
 	~RemoteClient()
 	{
 	}
-
-	/*
-		Finds block that should be sent next to the client.
-		Environment should be locked when this is called.
-		dtime is used for resetting send radius at slow interval
-	*/
-	void GetNextBlocks(Server *server, float dtime,
-			std::vector<PrioritySortedBlockTransfer> &dest);
-
-	void GotBlock(v3s16 p);
-
-	void SentBlock(v3s16 p);
-
-	void SetBlockNotSent(v3s16 p);
-	void SetBlocksNotSent(std::map<v3s16, MapBlock*> &blocks);
-
-	s32 SendingCount()
-	{
-		return m_blocks_sending.size();
-	}
-
+	
 	// Increments timeouts and removes timed-out blocks from list
 	// NOTE: This doesn't fix the server-not-sending-block bug
 	//       because it is related to emerging, not sending.
@@ -274,12 +446,8 @@ public:
 	void PrintInfo(std::ostream &o)
 	{
 		o<<"RemoteClient "<<peer_id<<": "
-				<<"m_blocks_sent.size()="<<m_blocks_sent.size()
-				<<", m_blocks_sending.size()="<<m_blocks_sending.size()
 				<<", m_nearest_unsent_d="<<m_nearest_unsent_d
-				<<", m_excess_gotblocks="<<m_excess_gotblocks
 				<<std::endl;
-		m_excess_gotblocks = 0;
 	}
 
 	// Time from last placing or removing blocks
@@ -311,26 +479,7 @@ private:
 	s16 m_nearest_unsent_d;
 	v3s16 m_last_center;
 	float m_nearest_unsent_reset_timer;
-
-	/*
-		Blocks that are currently on the line.
-		This is used for throttling the sending of blocks.
-		- The size of this list is limited to some value
-		Block is added when it is sent with BLOCKDATA.
-		Block is removed when GOTBLOCKS is received.
-		Value is time from sending. (not used at the moment)
-	*/
-	std::map<v3s16, float> m_blocks_sending;
-
-	/*
-		Count of excess GotBlocks().
-		There is an excess amount because the client sometimes
-		gets a block so late that the server sends it again,
-		and the client then sends two GOTBLOCKs.
-		This is resetted by PrintInfo()
-	*/
-	u32 m_excess_gotblocks;
-
+	
 	// CPU usage optimization
 	u32 m_nothing_to_send_counter;
 	float m_nothing_to_send_pause_timer;
@@ -557,7 +706,6 @@ private:
 			std::list<u16> *far_players=NULL, float far_d_nodes=100);
 	void sendAddNode(v3s16 p, MapNode n, u16 ignore_id=0,
 			std::list<u16> *far_players=NULL, float far_d_nodes=100);
-	void setBlockNotSent(v3s16 p);
 
 	// Environment and Connection must be locked when called
 	void SendBlockNoLock(u16 peer_id, MapBlock *block, u8 ver, u16 net_proto_version);
@@ -801,6 +949,7 @@ private:
 
 	friend class EmergeThread;
 	friend class RemoteClient;
+	friend class BlockSendQueue;
 
 	std::map<std::string,MediaInfo> m_media;
 
@@ -820,6 +969,9 @@ private:
 		Particles
 	*/
 	std::vector<u32> m_particlespawner_ids;
+
+	/* Block send queue */
+	BlockSendQueue m_block_send_queue;
 };
 
 /*

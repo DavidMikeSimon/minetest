@@ -53,6 +53,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include <curl/curl.h>
 #endif
 
+#define PP(x) "("<<(x).X<<","<<(x).Y<<","<<(x).Z<<")"
+
 static std::string getMediaCacheDir()
 {
 	return porting::path_user + DIR_DELIM + "cache" + DIR_DELIM + "media";
@@ -64,8 +66,7 @@ static std::string getMediaCacheDir()
 
 QueuedMeshUpdate::QueuedMeshUpdate():
 	p(-1337,-1337,-1337),
-	data(NULL),
-	ack_block_to_server(false)
+	data(NULL)
 {
 }
 
@@ -100,7 +101,7 @@ MeshUpdateQueue::~MeshUpdateQueue()
 /*
 	peer_id=0 adds with nobody to send to
 */
-void MeshUpdateQueue::addBlock(v3s16 p, MeshMakeData *data, bool ack_block_to_server, bool urgent)
+void MeshUpdateQueue::addBlock(v3s16 p, MeshMakeData *data, bool urgent)
 {
 	DSTACK(__FUNCTION_NAME);
 
@@ -125,8 +126,6 @@ void MeshUpdateQueue::addBlock(v3s16 p, MeshMakeData *data, bool ack_block_to_se
 			if(q->data)
 				delete q->data;
 			q->data = data;
-			if(ack_block_to_server)
-				q->ack_block_to_server = true;
 			return;
 		}
 	}
@@ -137,7 +136,6 @@ void MeshUpdateQueue::addBlock(v3s16 p, MeshMakeData *data, bool ack_block_to_se
 	QueuedMeshUpdate *q = new QueuedMeshUpdate;
 	q->p = p;
 	q->data = data;
-	q->ack_block_to_server = ack_block_to_server;
 	m_queue.push_back(q);
 }
 
@@ -186,7 +184,8 @@ void * MeshUpdateThread::Thread()
 			sleep_ms(3);
 			continue;
 		}*/
-
+		
+		bool is_urgent = (m_queue_in.urgent_size() > 0);
 		QueuedMeshUpdate *q = m_queue_in.pop();
 		if(q == NULL)
 		{
@@ -206,13 +205,14 @@ void * MeshUpdateThread::Thread()
 		MeshUpdateResult r;
 		r.p = q->p;
 		r.mesh = mesh_new;
-		r.ack_block_to_server = q->ack_block_to_server;
 
 		/*infostream<<"MeshUpdateThread: Processed "
 				<<"("<<q->p.X<<","<<q->p.Y<<","<<q->p.Z<<")"
 				<<std::endl;*/
-
-		m_queue_out.push_back(r);
+		if(is_urgent)
+			m_queue_out_urgent.push_back(r);
+		else
+			m_queue_out.push_back(r);
 
 		delete q;
 	}
@@ -312,7 +312,8 @@ Client::Client(
 	m_last_time_of_day_f(-1),
 	m_time_of_day_update_timer(0),
 	m_recommended_send_interval(0.1),
-	m_removed_sounds_check_timer(0)
+	m_removed_sounds_check_timer(0),
+	m_dtime_avg(0.05)
 {
 	m_packetcounter_timer = 0.0;
 	//m_delete_unused_sectors_timer = 0.0;
@@ -320,6 +321,7 @@ Client::Client(
 	m_avg_rtt_timer = 0.0;
 	m_playerpos_send_timer = 0.0;
 	m_ignore_damage_timer = 0.0;
+	m_request_blocks_timer = 0.0;
 
 	/*
 		Add local player
@@ -406,6 +408,8 @@ void Client::step(float dtime)
 	if(dtime > 2.0)
 		dtime = 2.0;
 	
+	m_dtime_avg = m_dtime_avg * 0.98 + dtime * 0.2;
+	
 	if(m_ignore_damage_timer > dtime)
 		m_ignore_damage_timer -= dtime;
 	else
@@ -457,7 +461,7 @@ void Client::step(float dtime)
 			Delete unused sectors
 
 			NOTE: This jams the game for a while because deleting sectors
-			      clear caches
+						clear caches
 		*/
 		
 		float &counter = m_delete_unused_sectors_timer;
@@ -605,50 +609,6 @@ void Client::step(float dtime)
 		/*if(deleted_blocks.size() > 0)
 			infostream<<"Client: Unloaded "<<deleted_blocks.size()
 					<<" unused blocks"<<std::endl;*/
-			
-		/*
-			Send info to server
-			NOTE: This loop is intentionally iterated the way it is.
-		*/
-
-		std::list<v3s16>::iterator i = deleted_blocks.begin();
-		std::list<v3s16> sendlist;
-		for(;;)
-		{
-			if(sendlist.size() == 255 || i == deleted_blocks.end())
-			{
-				if(sendlist.size() == 0)
-					break;
-				/*
-					[0] u16 command
-					[2] u8 count
-					[3] v3s16 pos_0
-					[3+6] v3s16 pos_1
-					...
-				*/
-				u32 replysize = 2+1+6*sendlist.size();
-				SharedBuffer<u8> reply(replysize);
-				writeU16(&reply[0], TOSERVER_DELETEDBLOCKS);
-				reply[2] = sendlist.size();
-				u32 k = 0;
-				for(std::list<v3s16>::iterator
-						j = sendlist.begin();
-						j != sendlist.end(); ++j)
-				{
-					writeV3S16(&reply[2+1+6*k], *j);
-					k++;
-				}
-				m_con.Send(PEER_ID_SERVER, 1, reply, true);
-
-				if(i == deleted_blocks.end())
-					break;
-
-				sendlist.clear();
-			}
-
-			sendlist.push_back(*i);
-			++i;
-		}
 	}
 
 	/*
@@ -718,6 +678,21 @@ void Client::step(float dtime)
 	}
 
 	/*
+		Request blocks
+	*/
+	{
+		float interval = 0.5;
+		float &counter = m_request_blocks_timer;
+		counter += dtime;
+		if (counter >= interval &&
+				m_con.GetPeerOutgoingQueueSizeSeconds(PEER_ID_SERVER) < interval)
+		{
+			counter = 0.0;
+			sendRequestForBlocks(interval);
+		}
+	}
+
+	/*
 		Send player position to server
 	*/
 	{
@@ -747,7 +722,11 @@ void Client::step(float dtime)
 		while(!m_mesh_update_thread.m_queue_out.empty())
 		{
 			num_processed_meshes++;
-			MeshUpdateResult r = m_mesh_update_thread.m_queue_out.pop_front();
+			MeshUpdateResult r;
+			if(m_mesh_update_thread.m_queue_out_urgent.size() > 0)
+				r = m_mesh_update_thread.m_queue_out_urgent.pop_front();
+			else
+				r = m_mesh_update_thread.m_queue_out.pop_front();
 			MapBlock *block = m_env.getMap().getBlockNoCreateNoEx(r.p);
 			if(block)
 			{
@@ -765,28 +744,6 @@ void Client::step(float dtime)
 				block->mesh = r.mesh;
 			} else {
 				delete r.mesh;
-			}
-			if(r.ack_block_to_server)
-			{
-				/*infostream<<"Client: ACK block ("<<r.p.X<<","<<r.p.Y
-						<<","<<r.p.Z<<")"<<std::endl;*/
-				/*
-					Acknowledge block
-				*/
-				/*
-					[0] u16 command
-					[2] u8 count
-					[3] v3s16 pos_0
-					[3+6] v3s16 pos_1
-					...
-				*/
-				u32 replysize = 2+1+6;
-				SharedBuffer<u8> reply(replysize);
-				writeU16(&reply[0], TOSERVER_GOTBLOCKS);
-				reply[2] = 1;
-				writeV3S16(&reply[3], r.p);
-				// Send as reliable
-				m_con.Send(PEER_ID_SERVER, 1, reply, true);
 			}
 		}
 		if(num_processed_meshes > 0)
@@ -1265,80 +1222,68 @@ void Client::ProcessData(u8 *data, u32 datasize, u16 sender_peer_id)
 	else if(command == TOCLIENT_BLOCKDATA)
 	{
 		// Ignore too small packet
-		if(datasize < 8)
+		if(datasize < 2)
 			return;
 			
-		v3s16 p;
-		p.X = readS16(&data[2]);
-		p.Y = readS16(&data[4]);
-		p.Z = readS16(&data[6]);
+		std::string datastring((char*)&data[2], datasize-2);
+		std::istringstream is(datastring, std::ios_base::binary);
 		
-		/*infostream<<"Client: Thread: BLOCKDATA for ("
-				<<p.X<<","<<p.Y<<","<<p.Z<<")"<<std::endl;*/
-		/*infostream<<"Client: Thread: BLOCKDATA for ("
-				<<p.X<<","<<p.Y<<","<<p.Z<<")"<<std::endl;*/
-		
-		std::string datastring((char*)&data[8], datasize-8);
-		std::istringstream istr(datastring, std::ios_base::binary);
-		
+		v3s16 p = readV3S16(is);
+		u32 change_counter = readU32(is);
+
 		MapSector *sector;
 		MapBlock *block;
-		
 		v2s16 p2d(p.X, p.Z);
 		sector = m_env.getMap().emergeSector(p2d);
-		
 		assert(sector->getPos() == p2d);
+		block = sector->getBlockNoCreateNoEx(p.Y);
+		if (block && block->getChangeCounter() >= change_counter) {
+			// We already have a newer version of this block
+			// Don't need to bother deserializing
+			/*infostream<<"Client: TOCLIENT_BLOCKDATA: Already have "
+					<<PP(p)<<" rev. "<<block->getChangeCounter()
+					<<", server sent rev. "<<change_counter<<std::endl;*/
+			return;
+		}
+		
+		ScopeProfiler sp(g_profiler, "Client: TOCLIENT_BLOCKDATA", SPT_AVG);
 
+		/*infostream<<"Client: Thread: BLOCKDATA for ("
+				<<p.X<<","<<p.Y<<","<<p.Z<<")"<<std::endl;*/
+		/*infostream<<"Client: Thread: BLOCKDATA for ("
+				<<p.X<<","<<p.Y<<","<<p.Z<<")"<<std::endl;*/
+		
 		//TimeTaker timer("MapBlock deSerialize");
 		// 0ms
-		
-		block = sector->getBlockNoCreateNoEx(p.Y);
+
 		if(block)
 		{
-			/*
-				Update an existing block
-			*/
+			// Update an existing block
 			//infostream<<"Updating"<<std::endl;
 			block->deSerialize(istr, ser_version, false);
 			block->deSerializeNetworkSpecific(istr);
+			block->setChangeCounter(change_counter);
 		}
 		else
 		{
-			/*
-				Create a new block
-			*/
+			// Create a new block
 			//infostream<<"Creating new"<<std::endl;
 			block = new MapBlock(&m_env.getMap(), p, this);
 			block->deSerialize(istr, ser_version, false);
 			block->deSerializeNetworkSpecific(istr);
+			block->setChangeCounter(change_counter);
 			sector->insertBlock(block);
 		}
 
-#if 0
-		/*
-			Acknowledge block
-		*/
-		/*
-			[0] u16 command
-			[2] u8 count
-			[3] v3s16 pos_0
-			[3+6] v3s16 pos_1
-			...
-		*/
-		u32 replysize = 2+1+6;
-		SharedBuffer<u8> reply(replysize);
-		writeU16(&reply[0], TOSERVER_GOTBLOCKS);
-		reply[2] = 1;
-		writeV3S16(&reply[3], p);
-		// Send as reliable
-		m_con.Send(PEER_ID_SERVER, 1, reply, true);
-#endif
-
-		/*
-			Add it to mesh update queue and set it to be acknowledged after update.
-		*/
-		//infostream<<"Adding mesh update task for received block"<<std::endl;
-		addUpdateMeshTaskWithEdge(p, true);
+		/*infostream<<"Client: TOCLIENT_BLOCKDATA: "
+				<<analyze_block(block)<<std::endl;*/
+		
+		// Pre-queue the addition of the task, to spread processing between frames
+		PreQueuedMeshUpdate pq;
+		pq.p = p;
+		pq.urgent = false;
+		pq.with_edge = true;
+		m_update_mesh_task_pre_queue.push_back(pq);
 	}
 	else if(command == TOCLIENT_INVENTORY)
 	{
@@ -2488,6 +2433,89 @@ void Client::sendPlayerItem(u16 item)
 	Send(0, data, true);
 }
 
+void Client::sendRequestForBlocks(float timeout)
+{
+	// Request blocks adjacent to the player
+	core::map<v3s16, bool> adjacent_blocks;
+	Player* player = m_env.getLocalPlayer();
+	v3s16 pbpos = getNodeBlockPos(floatToInt(player->getPosition(), BS));
+	for(int x = pbpos.X-1; x <= pbpos.X+1; ++x) {
+		for(int y = pbpos.Y-1; y <= pbpos.Y+1; ++y) {
+			for(int z = pbpos.Z-1; z <= pbpos.Z+1; ++z) {
+				adjacent_blocks.set(v3s16(x,y,z), true);
+			}
+		}
+	}
+	
+	// Request blocks viewable by the player at last draw
+	core::map<v3s16, bool>& viewable_blocks =
+		const_cast<core::map<v3s16, bool>&>(
+			m_env.getClientMap().nextBlocksToRequest()
+		);
+	
+	core::map<v3s16, bool>::Iterator i;
+	
+	// Find the coordinate range and change counters of requested blocks
+	bool first_block = true;
+	v3s16 req_min_pos, req_max_pos;
+	core::map<v3s16, bool> request_blocks; // Value is dummy
+	for (int m = 0; m < 2; ++m)
+	{
+		// If mesh generation is fully booked, skip other than adjacent blocks
+		if(m == 1 && m_update_mesh_task_pre_queue.size() > 0)
+			continue;
+
+		core::map<v3s16, bool>* map =
+			(m == 0 ? &adjacent_blocks : &viewable_blocks);
+
+		for (core::map<v3s16, bool>::Iterator i = map->getIterator();
+				 i.atEnd() == false; i++)
+		{
+			v3s16 bpos = i->getKey();
+			if (first_block) {
+				req_min_pos = req_max_pos = bpos;
+				first_block = false;
+			} else {
+				if (bpos.X < req_min_pos.X) req_min_pos.X = bpos.X;
+				if (bpos.Y < req_min_pos.Y) req_min_pos.Y = bpos.Y;
+				if (bpos.Z < req_min_pos.Z) req_min_pos.Z = bpos.Z;
+				if (bpos.X > req_max_pos.X) req_max_pos.X = bpos.X;
+				if (bpos.Y > req_max_pos.Y) req_max_pos.Y = bpos.Y;
+				if (bpos.Z > req_max_pos.Z) req_max_pos.Z = bpos.Z;
+			}
+
+			request_blocks.set(bpos, true);
+		}
+	}
+
+	// Write the request
+	std::ostringstream os(std::ios_base::binary);
+	writeU16(os, TOSERVER_REQUEST_BLOCKS);
+	writeU16(os, timeout * 1000);
+	writeV3S16(os, req_min_pos);
+	writeV3S16(os, req_max_pos);
+	for (int x = req_min_pos.X; x <= req_max_pos.X; ++x) {
+		for (int y = req_min_pos.Y; y <= req_max_pos.Y; ++y) {
+			for (int z = req_min_pos.Z; z <= req_max_pos.Z; ++z) {
+				v3s16 bpos = v3s16(x,y,z);
+				u32 cc = BLOCK_CHANGECOUNTER_UNDEFINED; // Don't request
+				if(request_blocks.find(bpos)){
+					MapBlock* b = m_env.getMap().getBlockNoCreateNoEx(bpos);
+					cc = 0; // Request any version unless block exists
+					if (b != NULL) cc = b->getChangeCounter();
+				}
+				//infostream<<"Client: version of "<<PP(bpos)<<" is "<<cc<<std::endl;
+				writeU32(os, cc);
+			}
+		}
+	}
+
+	// Send the request
+	std::string s = os.str();
+	SharedBuffer<u8> data((u8*)s.c_str(), s.size());
+	Send(0, data, true); // Send as reliable
+}
+
 void Client::removeNode(v3s16 p)
 {
 	std::map<v3s16, MapBlock*> modified_blocks;
@@ -2502,7 +2530,7 @@ void Client::removeNode(v3s16 p)
 	}
 	
 	// add urgent task to update the modified node
-	addUpdateMeshTaskForNode(p, false, true);
+	addUpdateMeshTaskForNode(p, true);
 
 	for(std::map<v3s16, MapBlock * >::iterator
 			i = modified_blocks.begin();
@@ -2706,12 +2734,12 @@ void Client::setCrack(int level, v3s16 pos)
 	if(old_crack_level >= 0 && (level < 0 || pos != old_crack_pos))
 	{
 		// remove old crack
-		addUpdateMeshTaskForNode(old_crack_pos, false, true);
+		addUpdateMeshTaskForNode(old_crack_pos, true);
 	}
 	if(level >= 0 && (old_crack_level < 0 || pos != old_crack_pos))
 	{
 		// add new crack
-		addUpdateMeshTaskForNode(pos, false, true);
+		addUpdateMeshTaskForNode(pos, true);
 	}
 }
 
@@ -2762,11 +2790,10 @@ void Client::typeChatMessage(const std::wstring &message)
 	}
 }
 
-void Client::addUpdateMeshTask(v3s16 p, bool ack_to_server, bool urgent)
+void Client::addUpdateMeshTask(v3s16 p, bool urgent)
 {
 	/*infostream<<"Client::addUpdateMeshTask(): "
 			<<"("<<p.X<<","<<p.Y<<","<<p.Z<<")"
-			<<" ack_to_server="<<ack_to_server
 			<<" urgent="<<urgent
 			<<std::endl;*/
 
@@ -2784,7 +2811,10 @@ void Client::addUpdateMeshTask(v3s16 p, bool ack_to_server, bool urgent)
 		//TimeTaker timer("data fill");
 		// Release: ~0ms
 		// Debug: 1-6ms, avg=2ms
-		data->fill(b);
+		{
+			ScopeProfiler sp(g_profiler, "Client: data->fill", SPT_AVG);
+			data->fill(b);
+		}
 		data->setCrack(m_crack_level, m_crack_pos);
 		data->setSmoothLighting(g_settings->getBool("smooth_lighting"));
 	}
@@ -2793,14 +2823,14 @@ void Client::addUpdateMeshTask(v3s16 p, bool ack_to_server, bool urgent)
 	//while(m_mesh_update_thread.m_queue_in.size() > 0) sleep_ms(10);
 	
 	// Add task to queue
-	m_mesh_update_thread.m_queue_in.addBlock(p, data, ack_to_server, urgent);
+	m_mesh_update_thread.m_queue_in.addBlock(p, data, urgent);
 
 	/*infostream<<"Mesh update input queue size is "
 			<<m_mesh_update_thread.m_queue_in.size()
 			<<std::endl;*/
 }
 
-void Client::addUpdateMeshTaskWithEdge(v3s16 blockpos, bool ack_to_server, bool urgent)
+void Client::addUpdateMeshTaskWithEdge(v3s16 blockpos, bool urgent)
 {
 	/*{
 		v3s16 p = blockpos;
@@ -2812,7 +2842,7 @@ void Client::addUpdateMeshTaskWithEdge(v3s16 blockpos, bool ack_to_server, bool 
 	try{
 		v3s16 p = blockpos + v3s16(0,0,0);
 		//MapBlock *b = m_env.getMap().getBlockNoCreate(p);
-		addUpdateMeshTask(p, ack_to_server, urgent);
+		addUpdateMeshTask(p, urgent);
 	}
 	catch(InvalidPositionException &e){}
 	// Leading edge
@@ -2826,7 +2856,7 @@ void Client::addUpdateMeshTaskWithEdge(v3s16 blockpos, bool ack_to_server, bool 
 	}
 }
 
-void Client::addUpdateMeshTaskForNode(v3s16 nodepos, bool ack_to_server, bool urgent)
+void Client::addUpdateMeshTaskForNode(v3s16 nodepos, bool urgent)
 {
 	{
 		v3s16 p = nodepos;
@@ -2840,28 +2870,28 @@ void Client::addUpdateMeshTaskForNode(v3s16 nodepos, bool ack_to_server, bool ur
 
 	try{
 		v3s16 p = blockpos + v3s16(0,0,0);
-		addUpdateMeshTask(p, ack_to_server, urgent);
+		addUpdateMeshTask(p, urgent);
 	}
 	catch(InvalidPositionException &e){}
 	// Leading edge
 	if(nodepos.X == blockpos_relative.X){
 		try{
 			v3s16 p = blockpos + v3s16(-1,0,0);
-			addUpdateMeshTask(p, false, urgent);
+			addUpdateMeshTask(p, urgent);
 		}
 		catch(InvalidPositionException &e){}
 	}
 	if(nodepos.Y == blockpos_relative.Y){
 		try{
 			v3s16 p = blockpos + v3s16(0,-1,0);
-			addUpdateMeshTask(p, false, urgent);
+			addUpdateMeshTask(p, urgent);
 		}
 		catch(InvalidPositionException &e){}
 	}
 	if(nodepos.Z == blockpos_relative.Z){
 		try{
 			v3s16 p = blockpos + v3s16(0,0,-1);
-			addUpdateMeshTask(p, false, urgent);
+			addUpdateMeshTask(p, urgent);
 		}
 		catch(InvalidPositionException &e){}
 	}

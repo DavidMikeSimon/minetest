@@ -48,7 +48,8 @@ ClientMap::ClientMap(
 	m_control(control),
 	m_camera_position(0,0,0),
 	m_camera_direction(0,0,1),
-	m_camera_fov(M_PI)
+	m_camera_fov(M_PI),
+	m_next_to_request_list_needs_culling(false)
 {
 	m_camera_mutex.Init();
 	assert(m_camera_mutex.IsInitialized());
@@ -171,6 +172,10 @@ void ClientMap::updateDrawList(video::IVideoDriver* driver)
 	{
 		MapBlock *block = i->second;
 		block->refDrop();
+
+		m_last_drawn_sectors.clear();
+		m_last_blocks_needed.clear(); // FIXME: Should reset this less often
+		m_next_to_request_list_needs_culling = true;
 	}
 	m_drawlist.clear();
 
@@ -246,7 +251,7 @@ void ClientMap::updateDrawList(video::IVideoDriver* driver)
 		std::list< MapBlock * >::iterator i;
 		for(i=sectorblocks.begin(); i!=sectorblocks.end(); i++)
 		{
-			MapBlock *block = *i;
+			v3s16 bp(sp.X, by, sp.Y);
 
 			/*
 				Compare block position to camera position, skip
@@ -258,7 +263,7 @@ void ClientMap::updateDrawList(video::IVideoDriver* driver)
 				range = m_control.wanted_range * BS;
 
 			float d = 0.0;
-			if(isBlockInSight(block->getPos(), camera_position,
+			if(isBlockInSight(bp, camera_position,
 					camera_direction, camera_fov,
 					range, &d) == false)
 			{
@@ -273,23 +278,11 @@ void ClientMap::updateDrawList(video::IVideoDriver* driver)
 			blocks_in_range++;
 			
 			/*
-				Ignore if mesh doesn't exist
-			*/
-			{
-				//JMutexAutoLock lock(block->mesh_mutex);
-
-				if(block->mesh == NULL){
-					blocks_in_range_without_mesh++;
-					continue;
-				}
-			}
-
-			/*
 				Occlusion culling
 			*/
 
 			// No occlusion culling when free_move is on and camera is
-			// inside ground
+			// inside ground.
 			bool occlusion_culling_enabled = true;
 			if(g_settings->getBool("free_move")){
 				MapNode n = getNodeNoEx(cam_pos_nodes);
@@ -298,7 +291,7 @@ void ClientMap::updateDrawList(video::IVideoDriver* driver)
 					occlusion_culling_enabled = false;
 			}
 
-			v3s16 cpn = block->getPos() * MAP_BLOCKSIZE;
+			v3s16 cpn = bp * MAP_BLOCKSIZE;
 			cpn += v3s16(MAP_BLOCKSIZE/2, MAP_BLOCKSIZE/2, MAP_BLOCKSIZE/2);
 			float step = BS*1;
 			float stepfac = 1.1;
@@ -331,6 +324,33 @@ void ClientMap::updateDrawList(video::IVideoDriver* driver)
 			{
 				blocks_occlusion_culled++;
 				continue;
+			}
+
+			/*
+				Note for later that we were trying to display this block.
+			*/
+			MapBlock* block = sector->getBlockNoCreateNoEx(bp.Y);
+			if(block == NULL || block->isDummy()) {
+				core::map<v3s16, bool>::Iterator i =
+					m_last_blocks_needed.find(bp);
+				if (!(i.getNode() && i->getValue() == true)) {
+					// Don't set it to false if it's already true.
+					m_last_blocks_needed.set(bp, false);
+				}
+			} else {
+				m_last_blocks_needed.set(bp, true);
+			}
+
+			/*
+				Ignore if block or mesh doesn't exist
+			*/
+			{
+				//JMutexAutoLock lock(block->mesh_mutex);
+
+				if(block == NULL || block->mesh == NULL){
+					blocks_in_range_without_mesh++;
+					continue;
+				}
 			}
 			
 			// This block is in range. Reset usage timer.
@@ -885,9 +905,96 @@ void ClientMap::renderPostFx()
 	}
 }
 
+void ClientMap::renderBlockBoundaries()
+{
+	video::IVideoDriver* driver = SceneManager->getVideoDriver();
+	video::SMaterial mat;
+	mat.Lighting = false;
+	mat.ZWriteEnable = false;
+
+	core::aabbox3d<f32> bound;
+	core::map<v3s16, bool>& blocks =
+		const_cast<core::map<v3s16, bool>&>(nextBlocksToRequest());
+	core::map<v3s16, bool>::Iterator i;
+	const v3f inset(BS/2);
+	const v3f blocksize(MAP_BLOCKSIZE);
+
+	for (int pass = 0; pass < 2; ++pass) {
+		video::SColor color_offset(0, 0, 0, 0);
+		if (pass == 0) {
+			mat.Thickness = 1;
+			mat.ZBuffer = video::ECFN_ALWAYS;
+			color_offset.setGreen(64);
+		} else {
+			mat.Thickness = 3;
+			mat.ZBuffer = video::ECFN_LESSEQUAL;
+		}
+		driver->setMaterial(mat);
+
+		for (i=blocks.getIterator(); !i.atEnd(); i++) {
+			video::SColor color(255, 0, 0, 0);
+			if (i->getValue() == true) {
+				color.setBlue(255);
+			} else {
+				color.setRed(255);
+				color.setGreen(128);
+			}
+
+			v3s16 bpos = i->getKey();
+			bound.MinEdge = intToFloat(i->getKey(), BS)*blocksize
+				+ inset
+				- v3f(BS)*0.5;
+			bound.MaxEdge = bound.MinEdge
+				+ blocksize*BS
+				- inset
+				- inset;
+			color = color + color_offset;
+
+			driver->draw3DBox(bound, color);
+		}
+	}
+}
+
 void ClientMap::PrintInfo(std::ostream &out)
 {
 	out<<"ClientMap: ";
 }
 
+const core::map<v3s16, bool>& ClientMap::nextBlocksToRequest()
+{
+	if (m_next_to_request_list_needs_culling) {
+		// Don't try to request blocks that have no data and whose neighbors
+		// also all lack data. We can't tell if these blocks would
+		// be occlusion-culled until we have nearby geometry.
+		core::map<v3s16, bool>::Iterator i;
+		for(i=m_last_blocks_needed.getIterator(); !i.atEnd(); i++) {
+			if (i->getValue() == true) continue; // Don't cull blocks with data
 
+			bool cull = true;
+			v3s16 p = i->getKey();
+			v3s16 p0 = p - v3s16(1,1,1);
+			v3s16 p1 = p + v3s16(1,1,1);
+			for(int x = p0.X; x <= p1.X; ++x) {
+				for(int y = p0.Y; y <= p1.Y; ++y) {
+					for(int z = p0.Z; z <= p1.Z; ++z) {
+						core::map<v3s16, bool>::Iterator i =
+							m_last_blocks_needed.find(v3s16(x,y,z));
+						if (i.getNode() && i->getValue() == true) {
+							cull = false; break;
+						}
+					}
+					if (!cull) break;
+				}
+				if (!cull) break;
+			}
+
+			if (cull) {
+				m_last_blocks_needed.remove(p);
+			}
+		}
+
+		m_next_to_request_list_needs_culling = false;
+	}
+
+	return m_last_blocks_needed;
+}

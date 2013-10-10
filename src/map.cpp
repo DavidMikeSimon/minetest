@@ -2314,6 +2314,7 @@ void Map::setNodeMetadata(v3s16 p, NodeMetadata *meta)
 		return;
 	}
 	block->m_node_metadata.set(p_rel, meta);
+  block->raiseModified(MOD_STATE_WRITE_NEEDED, "setNodeMetadata");
 }
 
 void Map::removeNodeMetadata(v3s16 p)

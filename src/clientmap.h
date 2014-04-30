@@ -129,7 +129,7 @@ public:
 	void renderPostFx();
 
 	// For debugging the status and position of MapBlocks
-	void renderBlockBoundaries();
+	void renderDebugBlockBoundaries(bool xray);
 
 	// For debug printing
 	virtual void PrintInfo(std::ostream &out);
